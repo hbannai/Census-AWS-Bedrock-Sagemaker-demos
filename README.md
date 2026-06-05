@@ -74,6 +74,14 @@ aws bedrock list-model-invocation-jobs --region us-east-1 \
   --query "invocationJobSummaries[0].{name:jobName,status:status}" --output table
 ```
 
+Download batch results (after status = Completed):
+```bash
+aws s3 ls s3://<YOUR_BUCKET>/census-demo/batch/output/ --recursive
+aws s3 cp s3://<YOUR_BUCKET>/census-demo/batch/output/<JOB_ID>/input.jsonl.out batch-results.jsonl
+```
+
+> **Note:** Batch inference requires a minimum of 100 records in the input JSONL. The provided `batch_inference_input.jsonl` contains 101 prompts (50 states + DC + 30 county comparisons + 20 thematic questions). Only `amazon.nova-pro-v1:0` supports batch in us-east-1.
+
 ### Demo 2: SageMaker Forecast Endpoint
 
 Run from SageMaker Notebook terminal:
