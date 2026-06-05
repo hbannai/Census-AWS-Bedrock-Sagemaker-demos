@@ -1,0 +1,506 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Census Data Demo Workshop - Bedrock, SageMaker & Better Together
+  Deploys Lambda (data pull), IAM roles, SSM parameters, and SageMaker notebook.
+  No VPC. No new S3 bucket. GovCloud compatible.
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+Parameters:
+  AWSAccountId:
+    Type: String
+    Description: Your 12-digit AWS Account ID
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit number
+
+  AWSRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS Region (us-east-1 for commercial, us-gov-west-1 for GovCloud)
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-2
+      - us-gov-west-1
+      - us-gov-east-1
+
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-sonnet-4-20250514-v1:0
+    Description: Bedrock model ID for inference
+
+  ExistingS3BucketName:
+    Type: String
+    Description: Name of your existing S3 bucket (just the name, no s3:// prefix)
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Must be a valid S3 bucket name
+
+  S3Prefix:
+    Type: String
+    Default: census-demo/
+    Description: Folder prefix inside your S3 bucket for demo data
+
+  SageMakerInstanceType:
+    Type: String
+    Default: ml.m5.xlarge
+    Description: SageMaker instance type for training and endpoint
+    AllowedValues:
+      - ml.m5.large
+      - ml.m5.xlarge
+      - ml.m5.2xlarge
+      - ml.g5.xlarge
+      - ml.g5.2xlarge
+
+  CensusApiKey:
+    Type: String
+    Description: Census Bureau API key (free from api.census.gov/data/key_signup.html). Sign up at https://api.census.gov/data/key_signup.html
+
+# ============================================================
+# CONDITIONS
+# ============================================================
+Conditions:
+  IsGovCloud: !Or
+    - !Equals [!Ref AWSRegion, us-gov-west-1]
+    - !Equals [!Ref AWSRegion, us-gov-east-1]
+
+# ============================================================
+# RESOURCES
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # SSM Parameters (Model ID stored here for easy switching)
+  # ----------------------------------------------------------
+  SSMBedrockModelId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /census-demo/bedrock/model-id
+      Type: String
+      Value: !Ref BedrockModelId
+      Description: Bedrock model ID - update this to switch models without redeployment
+
+  SSMSageMakerEndpointName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /census-demo/sagemaker/endpoint-name
+      Type: String
+      Value: census-forecast-endpoint
+      Description: SageMaker endpoint name for population forecasting
+
+  SSMS3Bucket:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /census-demo/s3/bucket-name
+      Type: String
+      Value: !Ref ExistingS3BucketName
+      Description: S3 bucket for census demo data
+
+  SSMS3Prefix:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /census-demo/s3/prefix
+      Type: String
+      Value: !Ref S3Prefix
+      Description: S3 prefix for census demo data
+
+  # ----------------------------------------------------------
+  # IAM Role - Lambda (Census Data Pull)
+  # ----------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: census-demo-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !If
+          - IsGovCloud
+          - arn:aws-us-gov:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3WriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ExistingS3BucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ExistingS3BucketName}/${S3Prefix}*'
+        - PolicyName: SSMReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/census-demo/*'
+
+  # ----------------------------------------------------------
+  # IAM Role - Bedrock (Knowledge Base + Agent)
+  # ----------------------------------------------------------
+  BedrockServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: census-demo-bedrock-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ExistingS3BucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ExistingS3BucketName}/*'
+        - PolicyName: BedrockInvokeModel
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*'
+
+  # ----------------------------------------------------------
+  # IAM Role - SageMaker (Training + Endpoint)
+  # ----------------------------------------------------------
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: census-demo-sagemaker-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !If
+          - IsGovCloud
+          - arn:aws-us-gov:iam::aws:policy/AmazonSageMakerFullAccess
+          - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ExistingS3BucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ExistingS3BucketName}/*'
+        - PolicyName: SSMReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/census-demo/*'
+
+  # ----------------------------------------------------------
+  # IAM Role - Bedrock Agent Lambda (calls SageMaker endpoint)
+  # ----------------------------------------------------------
+  AgentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: census-demo-agent-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !If
+          - IsGovCloud
+          - arn:aws-us-gov:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeSageMaker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/census-forecast-endpoint'
+        - PolicyName: SSMRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/census-demo/*'
+
+  # ----------------------------------------------------------
+  # Lambda Function - Census Data Pull
+  # ----------------------------------------------------------
+  CensusDataPullFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: census-demo-data-pull
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref ExistingS3BucketName
+          S3_PREFIX: !Ref S3Prefix
+          CENSUS_API_KEY: !Ref CensusApiKey
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import csv
+          import io
+          import os
+          import boto3
+
+          s3 = boto3.client('s3')
+          BUCKET = os.environ['S3_BUCKET']
+          PREFIX = os.environ['S3_PREFIX']
+          API_KEY = os.environ['CENSUS_API_KEY']
+
+          def lambda_handler(event, context):
+              results = {}
+
+              # --- 1. State Demographics (2022 ACS 5-Year) ---
+              state_url = f"https://api.census.gov/data/2022/acs/acs5?get=NAME,B01001_001E,B19013_001E,B17001_002E,B15003_022E&for=state:*&key={API_KEY}"
+              state_data = fetch_census(state_url)
+              state_csv = to_csv(state_data, ['State','Population','Median_Income','Poverty_Count','Bachelors_Degree','State_FIPS'])
+              upload_to_s3(state_csv, f"{PREFIX}raw/state_demographics.csv")
+              results['states'] = len(state_data) - 1
+
+              # --- 2. County Demographics (2022 ACS 5-Year) ---
+              county_url = f"https://api.census.gov/data/2022/acs/acs5?get=NAME,B01001_001E,B19013_001E,B17001_002E&for=county:*&in=state:*&key={API_KEY}"
+              county_data = fetch_census(county_url)
+              county_csv = to_csv(county_data, ['County','Population','Median_Income','Poverty_Count','State_FIPS','County_FIPS'])
+              upload_to_s3(county_csv, f"{PREFIX}raw/county_demographics.csv")
+              results['counties'] = len(county_data) - 1
+
+              # --- 3. Historical Population (2012-2022 for SageMaker training) ---
+              historical_rows = [['Year','County','Population','State_FIPS','County_FIPS']]
+              for year in range(2012, 2023):
+                  try:
+                      url = f"https://api.census.gov/data/{year}/acs/acs5?get=NAME,B01001_001E&for=county:*&in=state:*&key={API_KEY}"
+                      data = fetch_census(url)
+                      for row in data[1:]:
+                          historical_rows.append([str(year), row[0], row[1], row[2], row[3]])
+                  except Exception as e:
+                      print(f"Skipping year {year}: {e}")
+              hist_csv = list_to_csv(historical_rows)
+              upload_to_s3(hist_csv, f"{PREFIX}raw/historical_population.csv")
+              results['historical_rows'] = len(historical_rows) - 1
+
+              # --- 4. Knowledge Base formatted text ---
+              kb_text = generate_kb_documents(state_data)
+              upload_to_s3(kb_text, f"{PREFIX}knowledgebase/census_state_summaries.txt")
+              results['kb_documents'] = 'generated'
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(results)
+              }
+
+          def fetch_census(url):
+              req = urllib.request.Request(url)
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  return json.loads(resp.read().decode())
+
+          def to_csv(data, headers):
+              output = io.StringIO()
+              writer = csv.writer(output)
+              writer.writerow(headers)
+              for row in data[1:]:
+                  writer.writerow(row)
+              return output.getvalue()
+
+          def list_to_csv(rows):
+              output = io.StringIO()
+              writer = csv.writer(output)
+              for row in rows:
+                  writer.writerow(row)
+              return output.getvalue()
+
+          def upload_to_s3(content, key):
+              s3.put_object(Bucket=BUCKET, Key=key, Body=content.encode('utf-8'), ContentType='text/csv')
+              print(f"Uploaded: s3://{BUCKET}/{key}")
+
+          def generate_kb_documents(state_data):
+              lines = []
+              lines.append("# US Census Data - State Demographics (2022 ACS 5-Year Estimates)\n\n")
+              for row in state_data[1:]:
+                  name, pop, income, poverty, bachelors, fips = row
+                  pop = int(pop) if pop else 0
+                  income = int(income) if income and int(income) > 0 else 0
+                  poverty = int(poverty) if poverty else 0
+                  bachelors = int(bachelors) if bachelors else 0
+                  poverty_rate = round((poverty / pop * 100), 1) if pop > 0 else 0
+
+                  lines.append(f"## {name}\n")
+                  lines.append(f"- Total Population: {pop:,}\n")
+                  lines.append(f"- Median Household Income: ${income:,}\n")
+                  lines.append(f"- Population Below Poverty Level: {poverty:,} ({poverty_rate}%)\n")
+                  lines.append(f"- Population with Bachelor's Degree: {bachelors:,}\n")
+                  lines.append(f"- State FIPS Code: {fips}\n\n")
+              return ''.join(lines)
+
+  # ----------------------------------------------------------
+  # Lambda Function - Bedrock Agent Tool (calls SageMaker)
+  # ----------------------------------------------------------
+  AgentToolFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: census-demo-agent-sagemaker-tool
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt AgentLambdaRole.Arn
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT: census-forecast-endpoint
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          sagemaker_runtime = boto3.client('sagemaker-runtime')
+          ENDPOINT = os.environ['SAGEMAKER_ENDPOINT']
+
+          def lambda_handler(event, context):
+              """
+              Bedrock Agent action group Lambda.
+              Receives county/state info, calls SageMaker forecast endpoint,
+              returns prediction to the agent.
+              """
+              # Parse agent request
+              agent = event.get('agent', {})
+              action_group = event.get('actionGroup', '')
+              api_path = event.get('apiPath', '')
+              parameters = event.get('parameters', [])
+
+              # Extract county and state from parameters
+              county_fips = None
+              state_fips = None
+              for param in parameters:
+                  if param.get('name') == 'county_fips':
+                      county_fips = param.get('value')
+                  elif param.get('name') == 'state_fips':
+                      state_fips = param.get('value')
+
+              # Call SageMaker endpoint
+              try:
+                  payload = json.dumps({
+                      'county_fips': county_fips,
+                      'state_fips': state_fips,
+                      'forecast_years': [2024, 2025, 2026, 2027, 2028]
+                  })
+
+                  response = sagemaker_runtime.invoke_endpoint(
+                      EndpointName=ENDPOINT,
+                      ContentType='application/json',
+                      Body=payload
+                  )
+
+                  result = json.loads(response['Body'].read().decode())
+                  response_body = {
+                      'TEXT': {
+                          'body': json.dumps(result)
+                      }
+                  }
+              except Exception as e:
+                  response_body = {
+                      'TEXT': {
+                          'body': json.dumps({'error': str(e), 'message': 'SageMaker endpoint not available. Deploy the forecast model first (Demo B).'})
+                      }
+                  }
+
+              # Return in Bedrock Agent format
+              return {
+                  'messageVersion': '1.0',
+                  'response': {
+                      'actionGroup': action_group,
+                      'apiPath': api_path,
+                      'httpMethod': 'POST',
+                      'httpStatusCode': 200,
+                      'responseBody': response_body
+                  }
+              }
+
+
+  # ----------------------------------------------------------
+  # Lambda Permission - Allow Bedrock Agent to invoke tool Lambda
+  # ----------------------------------------------------------
+  AgentToolLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AgentToolFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWSAccountId
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+Outputs:
+  LambdaFunctionName:
+    Description: Census data pull Lambda function name
+    Value: !Ref CensusDataPullFunction
+
+  AgentToolFunctionArn:
+    Description: ARN of the Agent Tool Lambda (use when creating Bedrock Agent)
+    Value: !GetAtt AgentToolFunction.Arn
+
+  BedrockServiceRoleArn:
+    Description: ARN of Bedrock service role (use when creating Knowledge Base)
+    Value: !GetAtt BedrockServiceRole.Arn
+
+  SageMakerRoleArn:
+    Description: ARN of SageMaker execution role
+    Value: !GetAtt SageMakerExecutionRole.Arn
+
+  S3DataPath:
+    Description: S3 path where census data will be stored
+    Value: !Sub 's3://${ExistingS3BucketName}/${S3Prefix}'
+
+  SSMModelIdParameter:
+    Description: SSM parameter for Bedrock model ID (update this to switch models)
+    Value: /census-demo/bedrock/model-id
