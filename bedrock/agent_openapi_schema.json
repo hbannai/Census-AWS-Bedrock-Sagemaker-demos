@@ -1,0 +1,77 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Census Population Forecast API",
+    "version": "1.0.0",
+    "description": "API for getting population forecasts from SageMaker model"
+  },
+  "paths": {
+    "/forecast": {
+      "post": {
+        "operationId": "getPopulationForecast",
+        "summary": "Get population forecast for a county",
+        "description": "Calls the SageMaker endpoint to get population predictions for 2024-2028 for a given county identified by FIPS codes.",
+        "parameters": [
+          {
+            "name": "county_fips",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "3-digit county FIPS code (e.g., 201 for Harris County)"
+          },
+          {
+            "name": "state_fips",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "2-digit state FIPS code (e.g., 48 for Texas)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Forecast results with predicted populations and confidence level",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "county": {
+                      "type": "string",
+                      "description": "County name"
+                    },
+                    "predictions": {
+                      "type": "array",
+                      "items": {
+                        "type": "number"
+                      },
+                      "description": "Predicted populations for forecast years"
+                    },
+                    "forecast_years": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer"
+                      },
+                      "description": "Years for the predictions"
+                    },
+                    "predicted_growth_rate": {
+                      "type": "number",
+                      "description": "Annual growth rate prediction"
+                    },
+                    "confidence": {
+                      "type": "string",
+                      "description": "Confidence level (high, medium, low)"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
